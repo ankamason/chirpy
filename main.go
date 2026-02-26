@@ -1,28 +1,49 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+	"github.com/ankamason/chirpy/internal/database"
 )
+
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	db             *database.Queries
 }
 
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatal("Can't connect to database:", err)
+	}
+
+	dbQueries := database.New(db)
+
 	mux := http.NewServeMux()
-	apiCfg := &apiConfig{}
+	apiCfg := &apiConfig{
+		db: dbQueries,
+	}
 
 	fileServer := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(fileServer))
 
 	mux.HandleFunc("GET /api/healthz", healthzHandler)
+	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
-	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -30,11 +51,13 @@ func main() {
 	}
 
 	fmt.Println("Server starting on :8080...")
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	if err != nil {
 		fmt.Println("Error starting server:", err)
 	}
 }
+
+
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
