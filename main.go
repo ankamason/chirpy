@@ -9,21 +9,24 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/ankamason/chirpy/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	"github.com/ankamason/chirpy/internal/database"
 )
-
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	platform       string
 }
 
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
+	platform := os.Getenv("PLATFORM")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -34,14 +37,16 @@ func main() {
 
 	mux := http.NewServeMux()
 	apiCfg := &apiConfig{
-		db: dbQueries,
+		db:       dbQueries,
+		platform: platform,
 	}
 
 	fileServer := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(fileServer))
 
 	mux.HandleFunc("GET /api/healthz", healthzHandler)
-	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
+	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
+	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 
@@ -57,7 +62,88 @@ func main() {
 	}
 }
 
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
 
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	type requestBody struct {
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	req := requestBody{}
+	err := decoder.Decode(&req)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	if len(req.Body) > 140 {
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
+		return
+	}
+
+	cleaned := cleanProfanity(req.Body)
+
+	dbChirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   cleaned,
+		UserID: req.UserID,
+	})
+	if err != nil {
+		log.Println("Error creating chirp:", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create chirp")
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, Chirp{
+		ID:        dbChirp.ID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+	})
+}
+
+func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
+	type requestBody struct {
+		Email string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	req := requestBody{}
+	err := decoder.Decode(&req)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	dbUser, err := cfg.db.CreateUser(r.Context(), req.Email)
+	if err != nil {
+		log.Println("Error creating user:", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create user")
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, User{
+		ID:        dbUser.ID,
+		CreatedAt: dbUser.CreatedAt,
+		UpdatedAt: dbUser.UpdatedAt,
+		Email:     dbUser.Email,
+	})
+}
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,10 +165,24 @@ func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		respondWithError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+
 	cfg.fileserverHits.Store(0)
+	log.Println("About to delete all users...")
+	err := cfg.db.DeleteAllUsers(r.Context())
+	if err != nil {
+		log.Println("Error deleting users:", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't delete users")
+		return
+	}
+	log.Println("Delete completed successfully")
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Hits reset to 0"))
+	w.Write([]byte("Hits reset to 0 and database reset"))
 }
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
@@ -121,34 +221,4 @@ func cleanProfanity(body string) string {
 	}
 
 	return strings.Join(words, " ")
-}
-func handlerValidateChirp(w http.ResponseWriter, r *http.Request) {
-	type requestBody struct {
-		Body string `json:"body"`
-	}
-
-	type responseBody struct {
-		Valid       bool   `json:"valid"`
-		CleanedBody string `json:"cleaned_body"`
-	}
-
-	decoder := json.NewDecoder(r.Body)
-	req := requestBody{}
-	err := decoder.Decode(&req)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Something went wrong")
-		return
-	}
-
-	if len(req.Body) > 140 {
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-		return
-	}
-
-	cleaned := cleanProfanity(req.Body)
-
-	respondWithJSON(w, http.StatusOK, responseBody{
-		Valid:       true,
-		CleanedBody: cleaned,
-	})
 }
