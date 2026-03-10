@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -152,5 +153,37 @@ func TestDifferentUsersGetDifferentTokens(t *testing.T) {
 
 	if returnedID2 != user2 {
 		t.Fatalf("Token2 should return user2 ID, got %v", returnedID2)
+	}
+}
+func TestGetBearerTokenValid(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer my-token-123")
+
+	token, err := GetBearerToken(headers)
+	if err != nil {
+		t.Fatalf("Error getting bearer token: %v", err)
+	}
+
+	if token != "my-token-123" {
+		t.Fatalf("Expected 'my-token-123', got '%s'", token)
+	}
+}
+
+func TestGetBearerTokenMissing(t *testing.T) {
+	headers := http.Header{}
+
+	_, err := GetBearerToken(headers)
+	if err == nil {
+		t.Fatal("Should error when Authorization header is missing")
+	}
+}
+
+func TestGetBearerTokenNoBearer(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Basic my-token-123")
+
+	_, err := GetBearerToken(headers)
+	if err == nil {
+		t.Fatal("Should error when Authorization header doesn't start with Bearer")
 	}
 }

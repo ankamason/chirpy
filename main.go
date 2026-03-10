@@ -11,23 +11,25 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ankamason/chirpy/internal/auth"
+	"github.com/ankamason/chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	"github.com/ankamason/chirpy/internal/auth"
-	"github.com/ankamason/chirpy/internal/database"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	jwtSecret      string
 }
 
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	jwtSecret := os.Getenv("JWT_SECRET")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -38,8 +40,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	apiCfg := &apiConfig{
-		db:       dbQueries,
-		platform: platform,
+		db:        dbQueries,
+		platform:  platform,
+		jwtSecret: jwtSecret,
 	}
 
 	fileServer := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
@@ -71,8 +74,8 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token,omitempty"`
 }
-
 type Chirp struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
@@ -83,13 +86,24 @@ type Chirp struct {
 
 func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
 	type requestBody struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing token")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token")
+		return
 	}
 
 	decoder := json.NewDecoder(r.Body)
 	req := requestBody{}
-	err := decoder.Decode(&req)
+	err = decoder.Decode(&req)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request")
 		return
@@ -104,7 +118,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 
 	dbChirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   cleaned,
-		UserID: req.UserID,
+		UserID: userID,
 	})
 	if err != nil {
 		log.Println("Error creating chirp:", err)
@@ -161,8 +175,9 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	type requestBody struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email            string `json:"email"`
+		Password         string `json:"password"`
+		ExpiresInSeconds *int   `json:"expires_in_seconds,omitempty"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -185,11 +200,26 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	expiresIn := time.Hour
+	if req.ExpiresInSeconds != nil {
+		requested := time.Duration(*req.ExpiresInSeconds) * time.Second
+		if requested < expiresIn {
+			expiresIn = requested
+		}
+	}
+
+	token, err := auth.MakeJWT(dbUser.ID, cfg.jwtSecret, expiresIn)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create token")
+		return
+	}
+
 	respondWithJSON(w, http.StatusOK, User{
 		ID:        dbUser.ID,
 		CreatedAt: dbUser.CreatedAt,
 		UpdatedAt: dbUser.UpdatedAt,
 		Email:     dbUser.Email,
+		Token:     token,
 	})
 }
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
